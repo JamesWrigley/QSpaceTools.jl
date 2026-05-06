@@ -1,0 +1,21 @@
+name = "QSpaceTools"
+uuid = "5cf787ff-debc-4fe4-8ca7-89fdeeb3c098"
+version = "0.1.0"
+authors = ["JamesWrigley <james@puiterwijk.org>"]
+
+[deps]
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
+
+[compat]
+DimensionalData = "0.30.1"
+HDF5 = "0.17.3"
+OhMyThreads = "0.8.5"
+
+[extras]
+CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["CondaPkg", "Test"]
