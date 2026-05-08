@@ -79,8 +79,11 @@ Attributes:
   format_version  int       2
 """
 
+import argparse
+
 import numpy as np
 import h5py
+import pyFAI
 from scipy.sparse import csr_matrix
 from pyFAI import units as pyFAI_units
 
@@ -287,3 +290,19 @@ def integrate(baked, image):
             return I.reshape(nbins0, nbins1)
         return I.reshape(nbins0, nbins1, batch_shape)
     return I
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Bake a pyFAI integrator from a PONI file to HDF5.")
+    parser.add_argument("poni_path", help="Path to the PONI file")
+    parser.add_argument("npt", type=int, help="Number of radial bins")
+    parser.add_argument("output_path", help="Output HDF5 file path")
+    args = parser.parse_args()
+
+    ai = pyFAI.load(args.poni_path)
+    baked = bake_for_batch(ai, args.npt)
+    write_hdf5(baked, args.output_path)
+
+
+if __name__ == "__main__":
+    main()
