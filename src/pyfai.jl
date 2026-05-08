@@ -151,7 +151,18 @@ function _wrap(b::BakedIntegrator, out::AbstractArray{Float32}, extra_shape::Tup
     end
 end
 
+"""
+    output_size(b::BakedIntegrator, frames::AbstractArray)
+
+Calculate the size of the output array needed for `integrate!(out, b, frames)`.
+"""
 output_size(b::BakedIntegrator) = b.ndim == 2 ? (b.npt0, b.npt1) : (b.npt0,)
+
+function output_size(b::BakedIntegrator, frames::AbstractArray)
+    nd_frame = length(b.shape)
+    extra_size = size(frames)[nd_frame + 1:end]
+    (output_size(b)..., extra_size...)
+end
 
 # Fused single-frame kernel. Each bin's NNZ is walked once; S and N
 # accumulate in scalar registers with on-the-fly `isfinite` masking.
@@ -185,9 +196,7 @@ end
 Allocate an output `Array` to be used with `integrate!()`.
 """
 function allocate_output(b::BakedIntegrator, frames::AbstractArray)
-    nd_frame = length(b.shape)
-    extra_shape = size(frames)[nd_frame + 1:end]
-    Array{Float32}(undef, output_size(b)..., extra_shape...)
+    Array{Float32}(undef, output_size(b, frames))
 end
 
 """
@@ -200,7 +209,7 @@ function integrate!(out::AbstractVector{Float32}, b::BakedIntegrator, frame::Abs
                     scheduler=nothing, chunksize=nothing)
     if size(frame) != b.shape
         throw(DimensionMismatch("frame size $(size(frame)) ≠ baked shape $(b.shape)"))
-    elseif size(out) != output_size(b)
+    elseif size(out) != output_size(b, frame)
         throw(DimensionMismatch("out length $(length(out)) ≠ nbins = $(b.npt0)"))
     end
 
@@ -226,8 +235,8 @@ function integrate!(out::AbstractArray{Float32}, b::BakedIntegrator, frames::Abs
         throw(ArgumentError("A vector was passed as `frame`, but it needs to be a 2D array with shape $(b.shape)"))
     elseif input_frame_size != b.shape
         throw(DimensionMismatch("frame size $(size(frames)[1:nd_frame]) ≠ baked shape $(b.shape)"))
-    elseif size(out) != (output_size(b)..., extra_shape...)
-        throw(DimensionMismatch("out size $(size(out)) ≠ (nbins, extra...) = $((output_size(b)..., extra_shape...))"))
+    elseif size(out) != output_size(b, frames)
+        throw(DimensionMismatch("out size $(size(out)) ≠ (nbins, extra...) = $(output_size(b, frames))"))
     end
 
     npix = prod(b.shape)
