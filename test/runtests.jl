@@ -1,7 +1,7 @@
 # Copy CondaPkg.toml to the test project so that it gets found by CondaPkg
 # during the tests. If this was instead in the project directory it would also
 # be used by CondaPkg outside of the tests, which we don't want.
-cp(joinpath(@__DIR__, "CondaPkg.toml"), joinpath(dirname(Base.active_project()), "CondaPkg.toml"))
+cp(joinpath(@__DIR__, "CondaPkg.toml"), joinpath(dirname(Base.active_project()), "CondaPkg.toml"); force=true)
 
 ENV["JULIA_CONDAPKG_ENV"] = "@qspacetools-tests"
 ENV["JULIA_CONDAPKG_VERBOSITY"] = -1
@@ -15,8 +15,48 @@ ENV["JULIA_CONDAPKG_VERBOSITY"] = -1
 
 
 using Test
+using PythonCall
 using QSpaceTools: QSpaceTools as QST
-using CondaPkg: CondaPkg
+
+@py import sys
+sys.path.append(dirname(@__DIR__))
+
+@py begin
+    import numpy as np
+    import pyFAI
+    import pyFAI.test.utilstest: create_fake_data
+    import bake_for_batch: bake_for_batch, write_hdf5
+end
+
+# A fresh fake detector image + configured AzimuthalIntegrator, as the
+# Python tests build in setUpClass. The image is cast to float32 and pyFAI's
+# empty-bin sentinel is set to NaN to match the exporter.
+function fake_data()
+    image, ai = create_fake_data(poissonian=false)
+    image = image.astype(np.float32)
+    # pyFAI snapshots its empty-bin sentinel from ai._empty at engine-creation
+    # time; the exporter always emits NaN for empty bins, so align pyFAI here.
+    ai._empty = np.nan
+    image, ai
+end
+
+# pyFAI/numpy frames are C-order (H, W); the Julia consumer wants (W, H) so
+# that column-major `vec` reproduces pyFAI's C-order flat index. Transposing
+# the numpy array hands PythonCall exactly that.
+jl_frame(img) = pyconvert(Matrix, img.T)
+
+# A 3-frame batch derived from `frame`: itself, a scaled copy, and a noisy one.
+function make_batch(frame)
+    cat(frame, frame .* 0.5f0, frame .+ rand(Float32, size(frame)); dims=3)
+end
+
+# Compare a Julia integration result against a reference array, checking the
+# NaN (empty-bin) pattern exactly and the finite values within tolerance.
+function compare_result(got, ref; rtol, atol)
+    mask = .!isnan.(ref)
+    @test isnan.(got) == isnan.(ref)
+    @test got[mask] ≈ ref[mask] rtol=rtol atol=atol
+end
 
 function test_integrator(; shape, npt0, npt1, ndim)
     nbins = ndim == 2 ? npt0 * npt1 : npt0
@@ -27,7 +67,7 @@ function test_integrator(; shape, npt0, npt1, ndim)
     )
 end
 
-@testset "allocate_output" begin
+@testset "allocate_output()" begin
     b1 = test_integrator(shape=(8, 6), npt0=10, npt1=0, ndim=1)
     b2 = test_integrator(shape=(8, 6), npt0=10, npt1=4, ndim=2)
 
@@ -37,10 +77,123 @@ end
     @test size(QST.allocate_output(b2, zeros(8, 6, 3))) == (10, 4, 3)
 end
 
-@testset "PyFAI correctness tests" begin
-    CondaPkg.withenv() do
-        test_file = joinpath(@__DIR__, "test_bake_for_batch.py")
+# Run one pyFAI reference integration (1D or 2D, selected by `ndim`) and
+# compare the baked Julia result against it. The only per-dimensionality bits
+# are the pyFAI entry point, the `npt` argument, and the result rank;
+# everything else — fake data, polarization, bin-center checks, comparison —
+# is shared.
+function check_split(split; ndim, with_pol=false, azimuth_range=nothing)
+    image, ai = fake_data()
+    unit = "q_A^-1"
+    pol = with_pol ? 0.97 : nothing
+    npt = ndim == 1 ? 800 : (500, 180)          # (npt_rad, npt_azim) for 2D
 
-        run(addenv(`python $test_file -f`, "PYFAI_JULIA_PROJECT" => Base.active_project()))
+    ai.reset()
+    ref = if ndim == 1
+        ai.integrate1d(image; npt, unit, method=(split, "csr", "cython"),
+                       correctSolidAngle=true, dummy=np.nan,
+                       polarization_factor=pol, azimuth_range)
+    else
+        npt_rad, npt_azim = npt
+        ai.integrate2d(image; npt_rad, npt_azim, unit,
+                       method=(split, "csr", "cython"), correctSolidAngle=true,
+                       dummy=np.nan, polarization_factor=pol, azimuth_range)
     end
+
+    # 1D intensity is a vector; 2D is (npt_azim, npt_rad), which lines up with
+    # the Julia consumer's (npt1, npt0) output directly.
+    ref_q = pyconvert(Vector, ref.radial)
+    ref_I = ndim == 1 ? pyconvert(Vector, ref.intensity) :
+                        pyconvert(Matrix, ref.intensity)
+
+    baked = bake_for_batch(ai, npt; unit, split, solidangle=true,
+                           polarization_factor=pol, azimuth_range)
+    @test pyconvert(Int, baked["ndim"]) == ndim
+    @test pyconvert(Vector, baked["bin_centers0"]) ≈ ref_q rtol=1e-6
+    if ndim == 2
+        @test pyconvert(Vector, baked["bin_centers1"]) ≈
+              pyconvert(Vector, ref.azimuthal) rtol=1e-5
+    end
+
+    got = parent(QST.integrate(QST.load_baked(baked), jl_frame(image)))
+    if ndim == 2
+        @test size(got) == reverse(npt)
+    end
+
+    compare_result(got, ref_I; rtol=1e-4, atol=1e-4)
+end
+
+# Integrate a 3-frame batch and check each slice equals the per-frame result.
+# Shape-agnostic: `selectdim` grabs the i-th output along the trailing batch
+# axis whether the per-frame output is a vector (1D) or matrix (2D).
+function check_batch(npt, seed)
+    image, ai = fake_data()
+    b = QST.load_baked(bake_for_batch(ai, npt; unit="2th_deg", split="bbox"))
+    batch = make_batch(jl_frame(image))
+    got_batch = parent(QST.integrate(b, batch))
+    @test size(got_batch, ndims(got_batch)) == size(batch, 3)
+
+    for i in axes(batch, 3)
+        got_one   = parent(QST.integrate(b, batch[:, :, i]))
+        got_slice = selectdim(got_batch, ndims(got_batch), i)
+        @test size(got_slice) == size(got_one)
+        mask = .!isnan.(got_one)
+        @test got_slice[mask] ≈ got_one[mask] rtol=1e-6 atol=1e-6
+    end
+end
+
+@testset "$(ndim)D correctness" for ndim in (1, 2)
+    @testset "split=$split" for split in ("no", "bbox", "full")
+        check_split(split; ndim)
+    end
+
+    @testset "with polarization (bbox)" begin
+        check_split("bbox"; ndim, with_pol=true)
+    end
+
+    if ndim == 1
+        @testset "1D with azimuth_range (bbox)" begin
+            check_split("bbox"; ndim=1, azimuth_range=(-45.0, 45.0))
+        end
+    end
+end
+
+@testset "$(ndim)D batch matches per-frame loop" for (ndim, npt, seed) in
+        ((1, 800, 7), (2, (500, 180), 13))
+    check_batch(npt, seed)
+end
+
+@testset "NaN pixels match pyFAI" begin
+    image, ai = fake_data()
+    npt, unit = 800, "2th_deg"
+
+    poisoned = image.copy()
+    idx = np.random.choice(poisoned.size, size=50, replace=false)
+    poisoned.reshape(-1)[idx] = np.float32(np.nan)
+
+    ai.reset()
+    ref = ai.integrate1d(poisoned; npt, unit, method=("bbox", "csr", "cython"),
+                         correctSolidAngle=true, dummy=np.nan)
+    ref_I = pyconvert(Vector, ref.intensity)
+
+    b = QST.load_baked(bake_for_batch(ai, npt; unit, split="bbox"))
+    got = parent(QST.integrate(b, jl_frame(poisoned)))
+    compare_result(got, ref_I; rtol=1e-4, atol=1e-4)
+end
+
+@testset "load_baked()" begin
+    # Test that load_baked() implementations match
+    for npt in (800, (500, 180))
+        image, ai = fake_data()
+        baked = bake_for_batch(ai, npt; unit="2th_deg", split="bbox")
+
+        mktempdir() do td
+            path = joinpath(td, "setup.h5")
+            write_hdf5(baked, path)
+            @test QST.load_baked(path) == QST.load_baked(baked)
+        end
+    end
+
+    # Check that load_baked(::Py) throws on non-dict inputs
+    @test_throws ArgumentError QST.load_baked(np.zeros(3))
 end

@@ -63,53 +63,75 @@ function Base.show(io::IO, b::BakedIntegrator)
     end
 end
 
+function Base.:(==)(a::BakedIntegrator, b::BakedIntegrator)
+    all(getfield(a, f) == getfield(b, f) for f in fieldnames(BakedIntegrator))
+end
+
+function Base.hash(b::BakedIntegrator, h::UInt)
+    for f in fieldnames(BakedIntegrator)
+        h = hash(getfield(b, f), h)
+    end
+
+    h
+end
+
+# Shared assembly for both `load_baked` methods (HDF5 file here, Python `baked`
+# dict in the PythonCall extension). `get(T, key)::T` pulls one field from the
+# backing store; everything that must stay in lockstep across backends lives
+# here: the +1 index shift, the (H,W)→(W,H) flip, and the 1D/2D field branch.
+function _baked_from(get)
+    ndim    = get(Int, "ndim")
+    shape_c = get(Vector{Int}, "shape")
+    length(shape_c) == 2 ||
+        error("only 2D detector shapes are supported here, got $shape_c")
+    H, W = shape_c
+
+    bin_centers1, unit1, npt1 = if ndim == 2
+        get(Vector{Float32}, "bin_centers1"), get(String, "unit1"), get(Int, "npt1")
+    else
+        Float32[], "", 0
+    end
+
+    # Reversed (W, H) so column-major `vec` matches pyFAI's C-order flat index
+    # without a remap.
+    BakedIntegrator(get(Vector{Int32}, "indptr")  .+ Int32(1),
+                    get(Vector{Int32}, "indices") .+ Int32(1),
+                    get(Vector{Float32}, "data_raw"),
+                    get(Vector{Float32}, "data_corr"),
+                    get(Vector{Float32}, "bin_centers0"),
+                    bin_centers1, (W, H),
+                    get(String, "unit0"), unit1, get(String, "split"),
+                    get(Int, "npt0"), npt1, ndim)
+end
+
+# pyFAI scalars/strings are stored as HDF5 attributes; the CSR arrays and bin
+# centers as datasets. `_baked_from`'s accessor dispatches on this split.
+const _BAKED_ATTRS = ("shape", "ndim", "unit0", "unit1", "split", "npt0", "npt1")
+
 function load_baked(path::AbstractString)
     h5open(path, "r") do f
-        data_raw     = read(f["data_raw"])::Vector{Float32}
-        data_corr    = read(f["data_corr"])::Vector{Float32}
-        indices      = read(f["indices"])::Vector{Int32}
-        indptr       = read(f["indptr"])::Vector{Int32}
-        bin_centers0 = read(f["bin_centers0"])::Vector{Float32}
-        shape_c      = Tuple(Int.(read_attribute(f, "shape")))
-        ndim         = Int(read_attribute(f, "ndim"))
-        unit0        = read_attribute(f, "unit0")::String
-        split        = read_attribute(f, "split")::String
-        npt0         = Int(read_attribute(f, "npt0"))
-        dummy        = Float32(read_attribute(f, "dummy"))
-        delta_dummy  = Float32(read_attribute(f, "delta_dummy"))
+        get(::Type{T}, key) where {T} =
+            if key in _BAKED_ATTRS
+                raw = read_attribute(f, key)
+                raw isa T ? raw : T(raw)
+            else
+                read(f[key])::T
+            end
 
-        if ndim == 2
-            bin_centers1 = read(f["bin_centers1"])::Vector{Float32}
-            unit1        = read_attribute(f, "unit1")::String
-            npt1         = Int(read_attribute(f, "npt1"))
-        else
-            bin_centers1 = Vector{Float32}()
-            unit1        = ""
-            npt1         = 0
-        end
+        b = _baked_from(get)
 
         # We don't apply pyFAI's per-frame |raw - dummy| <= delta_dummy mask;
         # warn if it's set so the user isn't surprised by drift from
         # `ai.integrate1d`.
+        dummy       = Float32(read_attribute(f, "dummy"))
+        delta_dummy = Float32(read_attribute(f, "delta_dummy"))
         if (isfinite(dummy) && dummy != 0) || (isfinite(delta_dummy) && delta_dummy != 0)
             @warn "baked integrator has nonzero pyFAI dummy/delta_dummy; \
                    these are NOT applied here, so I(q) may differ from \
                    ai.integrate1d on pixels matching the dummy sentinel" dummy delta_dummy
         end
 
-        length(shape_c) == 2 ||
-            error("only 2D detector shapes are supported here, got $shape_c")
-        H, W = shape_c
-
-        # Reversed (W, H) so column-major `vec` matches pyFAI's C-order flat
-        # index without a remap.
-        shape_jl = (W, H)
-
-        BakedIntegrator(indptr  .+ Int32(1),
-                        indices .+ Int32(1),
-                        data_raw, data_corr,
-                        bin_centers0, bin_centers1, shape_jl,
-                        unit0, unit1, split, npt0, npt1, ndim)
+        b
     end
 end
 
