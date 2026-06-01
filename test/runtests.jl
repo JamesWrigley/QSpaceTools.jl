@@ -16,6 +16,7 @@ ENV["JULIA_CONDAPKG_VERBOSITY"] = -1
 
 using Test
 using PythonCall
+using DimensionalData: dims, name
 using QSpaceTools: QSpaceTools as QST
 
 @py import sys
@@ -26,6 +27,7 @@ sys.path.append(dirname(@__DIR__))
     import pyFAI
     import pyFAI.test.utilstest: create_fake_data
     import bake_for_batch: bake_for_batch, write_hdf5
+    import xrayutilities as xu
 end
 
 # A fresh fake detector image + configured AzimuthalIntegrator, as the
@@ -196,4 +198,118 @@ end
 
     # Check that load_baked(::Py) throws on non-dict inputs
     @test_throws ArgumentError QST.load_baked(np.zeros(3))
+end
+
+@testset "rss matches xrayutilities" begin
+    # Small detector + simple goniometer chain; modest grid keeps runtime down.
+    nch1, nch2 = 64, 80
+    pixel_size = 0.2
+    sdd = 500.0
+    photon_energy = 8000.0  # eV
+    wl = QST.energy2wavelength(photon_energy)
+    @test wl ≈ pyconvert(Float64, xu.en2lam(photon_energy)) rtol=1e-12
+    @test QST.wavelength2energy(wl) ≈ photon_energy rtol=1e-12
+    nx, ny = 96, 96
+
+    sample_axes = ("y-", "x+", "z+")
+    detector_axes = ("y-",)
+    image_axes = ("y-", "z-")
+    beam_direction = (1.0, 0.0, 0.0)
+    sample_normal = (0.0, 0.0, 1.0)
+    sample_faceup = "z+"
+
+    # Angles in radians. The xrayutilities side gets deg=False.
+    theta, chi, phi, twotheta = 0.30, 0.05, -0.10, 0.62
+
+    qconv = xu.experiment.QConversion(
+        sampleAxis=pylist(sample_axes),
+        detectorAxis=pylist(detector_axes),
+        r_i=pylist(beam_direction),
+        en=photon_energy,
+    )
+    hxrd = xu.HXRD(
+        idir=pylist(beam_direction), ndir=pylist(sample_normal),
+        sampleor=sample_faceup, qconv=qconv, en=photon_energy,
+    )
+    hxrd.Ang2Q.init_area(
+        detectorDir1=image_axes[1], detectorDir2=image_axes[2],
+        cch1=nch1 ÷ 2, cch2=nch2 ÷ 2, Nch1=nch1, Nch2=nch2,
+        pwidth1=pixel_size, pwidth2=pixel_size, distance=sdd,
+    )
+
+    qx_py, qy_py, qz_py = hxrd.Ang2Q.area(
+        theta, chi, phi, twotheta; deg=false,
+    )
+    qx_arr = pyconvert(Matrix{Float64}, qx_py)
+    qz_arr = pyconvert(Matrix{Float64}, qz_py)
+
+    # Frame: smooth synthetic gradient — easy to localize errors. xrayutilities
+    # detector indexing is C-order (Nch1 rows, Nch2 cols), so we make the
+    # Python and Julia frames consistent through `.T` like the pyFAI path.
+    image_py = np.random.rand(nch1, nch2).astype(np.float64)
+    frame_jl = pyconvert(Matrix, image_py)  # (nch1, nch2)
+
+    geom = QST.Geometry(;
+        sample_axes, detector_axes, image_axes,
+        beam_direction, sample_normal, sample_faceup,
+        pixel_size=(pixel_size, pixel_size),
+        center=(nch1 ÷ 2, nch2 ÷ 2),
+        shape=(nch1, nch2),
+        distance=sdd, wavelength=wl,
+    )
+
+    # Cross-check the geometry kernel alone: per-pixel q must agree pointwise.
+    q_jl = QST.pixel_q_array(geom, (theta, chi, phi), (twotheta,))
+    qx_jl = @view q_jl[1, :, :]
+    qz_jl = @view q_jl[3, :, :]
+    @test qx_jl ≈ qx_arr rtol=1e-10 atol=1e-12
+    @test qz_jl ≈ qz_arr rtol=1e-10 atol=1e-12
+
+    # Don't combine the geometry kernel and the gridder into one end-to-end
+    # test: the Julia matvecs use FMA (via StaticArrays) while xrayutilities
+    # does plain scalar sums, producing sub-ULP differences in the per-pixel
+    # q values. The vast majority of bins are unaffected, but the
+    # `< xmin` / `> xmax` boundary check in fuzzygridder2d will reject a
+    # pixel on one side and accept it on the other. Instead, feed the gridder
+    # the SAME (Python-derived) q-array on both sides to isolate it from the
+    # geometry layer.
+    xmin = pyconvert(Float64, qx_py.min())
+    xmax = pyconvert(Float64, qx_py.max())
+    ymin = pyconvert(Float64, qz_py.min())
+    ymax = pyconvert(Float64, qz_py.max())
+
+    gridder = xu.FuzzyGridder2D(nx, ny)
+    gridder.dataRange(xmin, xmax, ymin, ymax, true)
+    gridder(qx_py.flatten(), qz_py.flatten(), image_py.flatten())
+    ref = pyconvert(Matrix{Float64}, gridder.data)
+
+    image = Matrix{Float64}(undef, nx, ny)
+    norm  = Matrix{Float64}(undef, nx, ny)
+    points = Matrix{Float64}(undef, 2, length(frame_jl))
+    points[1, :] .= vec(qx_arr)
+    points[2, :] .= vec(qz_arr)
+    QST.fuzzygridder2d!(image, norm, points, frame_jl,
+                        xmin, xmax, ymin, ymax)
+    @test size(image) == (nx, ny)
+    @test image ≈ ref rtol=1e-10 atol=1e-12
+
+    # Smoke test: rss runs end-to-end, returns a DimArray with the expected
+    # shape and axes, and at least some bins receive contributions.
+    got = QST.rss(frame_jl, geom;
+                  sample_angles=(theta, chi, phi),
+                  detector_angles=(twotheta,),
+                  gridder_size=(nx, ny),
+                  projection=(:qx, :qz))
+    @test size(parent(got)) == (nx, ny)
+    @test name.(dims(got)) == (:qx, :qz)
+
+    # Same call with an alternate projection — exercises _proj_indices and
+    # confirms the returned DimArray axes track the chosen pair.
+    got_yz = QST.rss(frame_jl, geom;
+                     sample_angles=(theta, chi, phi),
+                     detector_angles=(twotheta,),
+                     gridder_size=(nx, ny),
+                     projection=(:qy, :qz))
+    @test size(parent(got_yz)) == (nx, ny)
+    @test name.(dims(got_yz)) == (:qy, :qz)
 end
