@@ -218,8 +218,8 @@ end
     sample_normal = (0.0, 0.0, 1.0)
     sample_faceup = "z+"
 
-    # Angles in radians. The xrayutilities side gets deg=False.
-    theta, chi, phi, twotheta = 0.30, 0.05, -0.10, 0.62
+    # Angles in degrees, matching xrayutilities' default convention.
+    theta, chi, phi, twotheta = rad2deg.((0.30, 0.05, -0.10, 0.62))
 
     qconv = xu.experiment.QConversion(
         sampleAxis=pylist(sample_axes),
@@ -238,7 +238,7 @@ end
     )
 
     qx_py, qy_py, qz_py = hxrd.Ang2Q.area(
-        theta, chi, phi, twotheta; deg=false,
+        theta, chi, phi, twotheta; deg=true,
     )
     qx_arr = pyconvert(Matrix{Float64}, qx_py)
     qz_arr = pyconvert(Matrix{Float64}, qz_py)

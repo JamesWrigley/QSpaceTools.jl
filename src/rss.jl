@@ -69,6 +69,7 @@ end
 Bin a single detector `frame` into a 2D q-space image, allocating the output.
 Equivalent to allocating an output with [`allocate_output`](@ref) and a
 workspace with [`RSSWorkspace`](@ref), then calling [`rss!`](@ref).
+`sample_angles` and `detector_angles` are specified in degrees.
 """
 function rss(frame::AbstractMatrix, geom::Geometry;
              gridder_size::Tuple{Integer, Integer}=(500, 500),
@@ -93,7 +94,8 @@ defaults to a freshly allocated [`RSSWorkspace`](@ref); pass one explicitly
 to reuse buffers across frames.
 
 `image` must be an `(nx, ny)` `AbstractMatrix{Float64}`. See [`rss`](@ref)
-for the meaning of the remaining keyword arguments.
+for the meaning of the remaining keyword arguments. `sample_angles` and
+`detector_angles` are specified in degrees.
 """
 function rss!(image::AbstractMatrix{Float64}, frame::AbstractMatrix, geom::Geometry;
               sample_angles,

@@ -48,10 +48,10 @@ function parse_axis(s::AbstractString)
     AXIS_VECS[s]
 end
 
-# Right-handed rotation by `θ` around unit vector `e` (Rodrigues' formula).
+# Right-handed rotation by `θ_deg` degrees around unit vector `e` (Rodrigues' formula).
 # Axes like "y-" are passed as (0,-1,0); the sign is folded into the vector.
-@inline function rotation_arb(θ::Real, e::Vec3)
-    s, c = sincos(θ)
+@inline function rotation_arb(θ_deg::Real, e::Vec3)
+    s, c = sincosd(θ_deg)
     c1 = 1 - c
     ex, ey, ez = e
 
@@ -237,6 +237,7 @@ end
 Eager `(3, Nch1, Nch2)` array of per-pixel q-vectors: rows 1/2/3 are the
 qx/qy/qz components. Pixel indices `(j1, j2)` are 1-based externally; the
 kernel uses 0-based indices internally to match xrayutilities.
+`sample_angles` and `detector_angles` are specified in degrees.
 """
 function pixel_q_array(g::Geometry, sample_angles, detector_angles)
     ft = FrameTransform(g, sample_angles, detector_angles)
