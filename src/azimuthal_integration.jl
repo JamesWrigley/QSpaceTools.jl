@@ -35,6 +35,14 @@ const Radial    = Dim{:radial}
 const Azimuthal = Dim{:azimuthal}
 const Frame     = Dim{:frame}
 
+"""
+    BakedIntegrator
+
+An integrator baked from a configured `pyFAI.AzimuthalIntegrator`. Holds the
+frozen CSR sparse matrix and correction weights for either 1D or 2D azimuthal
+integration, along with the bin centres and unit strings for the output axes.
+Construct one with [`load_baked`](@ref) and apply it with [`integrate`](@ref).
+"""
 struct BakedIntegrator
     # CSR of A (≡ CSC of Aᵀ), shape (nbins, npix). `colptr[bin]:colptr[bin+1]-1`
     # gives each bin's NNZ slice; `rowval` holds 1-based pixel indices into
@@ -108,6 +116,14 @@ end
 # centers as datasets. `_baked_from`'s accessor dispatches on this split.
 const _BAKED_ATTRS = ("shape", "ndim", "unit0", "unit1", "split", "npt0", "npt1")
 
+"""
+    load_baked(path::AbstractString)
+
+Load a [`BakedIntegrator`](@ref) from an HDF5 file written by
+`bake_for_batch.write_hdf5(...)`. Warns if the bake carries a nonzero pyFAI
+`dummy`/`delta_dummy` sentinel, since that per-frame mask is *not* applied
+here and `I(q)` may then differ from `ai.integrate1d`.
+"""
 function load_baked(path::AbstractString)
     h5open(path, "r") do f
         get(::Type{T}, key) where {T} =

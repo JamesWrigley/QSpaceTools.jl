@@ -1,25 +1,25 @@
 name = "QSpaceTools"
 uuid = "5cf787ff-debc-4fe4-8ca7-89fdeeb3c098"
-version = "0.1.0"
-authors = ["JamesWrigley <james@puiterwijk.org>"]
+version = "1.0.0"
+authors = ["James Wrigley <james.wrigley@xfel.eu>"]
 
 [deps]
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
-ProfileSVG = "132c30aa-f267-4189-9183-c8a63c7e05e6"
-PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[weakdeps]
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 
 [extensions]
 QSpaceToolsPythonCallExt = "PythonCall"
 
 [compat]
-DimensionalData = "0.30.1"
-HDF5 = "0.17.3"
-OhMyThreads = "0.8.5"
-ProfileSVG = "0.2.2"
+DimensionalData = "0.30"
+HDF5 = "0.17"
+OhMyThreads = "0.8"
 PythonCall = "0.9"
 StaticArrays = "1"
 

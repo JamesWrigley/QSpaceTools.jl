@@ -200,26 +200,15 @@ end
     @test_throws ArgumentError QST.load_baked(np.zeros(3))
 end
 
-@testset "rss matches xrayutilities" begin
-    # Small detector + simple goniometer chain; modest grid keeps runtime down.
-    nch1, nch2 = 64, 80
-    pixel_size = 0.2
-    sdd = 500.0
-    photon_energy = 8000.0  # eV
-    wl = QST.energy2wavelength(photon_energy)
-    @test wl ≈ pyconvert(Float64, xu.en2lam(photon_energy)) rtol=1e-12
-    @test QST.wavelength2energy(wl) ≈ photon_energy rtol=1e-12
-    nx, ny = 96, 96
-
+# Small detector + simple goniometer chain, built identically on both sides.
+# Returns the xrayutilities HXRD and the matching Julia Geometry.
+function hxrd_geometry(; nch1, nch2, pixel_size=0.2, sdd=500.0, photon_energy=8000.0)
     sample_axes = ("y-", "x+", "z+")
     detector_axes = ("y-",)
     image_axes = ("y-", "z-")
     beam_direction = (1.0, 0.0, 0.0)
     sample_normal = (0.0, 0.0, 1.0)
     sample_faceup = "z+"
-
-    # Angles in degrees, matching xrayutilities' default convention.
-    theta, chi, phi, twotheta = rad2deg.((0.30, 0.05, -0.10, 0.62))
 
     qconv = xu.experiment.QConversion(
         sampleAxis=pylist(sample_axes),
@@ -237,6 +226,31 @@ end
         pwidth1=pixel_size, pwidth2=pixel_size, distance=sdd,
     )
 
+    geom = QST.Geometry(;
+        sample_axes, detector_axes, image_axes,
+        beam_direction, sample_normal, sample_faceup,
+        pixel_size=(pixel_size, pixel_size),
+        center=(nch1 ÷ 2, nch2 ÷ 2),
+        shape=(nch1, nch2),
+        distance=sdd, wavelength=QST.energy2wavelength(photon_energy),
+    )
+
+    return hxrd, geom
+end
+
+@testset "rss matches xrayutilities" begin
+    nch1, nch2 = 64, 80
+    photon_energy = 8000.0  # eV
+    wl = QST.energy2wavelength(photon_energy)
+    @test wl ≈ pyconvert(Float64, xu.en2lam(photon_energy)) rtol=1e-12
+    @test QST.wavelength2energy(wl) ≈ photon_energy rtol=1e-12
+    nx, ny = 96, 96
+
+    hxrd, geom = hxrd_geometry(; nch1, nch2, photon_energy)
+
+    # Angles in degrees, matching xrayutilities' default convention.
+    theta, chi, phi, twotheta = rad2deg.((0.30, 0.05, -0.10, 0.62))
+
     qx_py, qy_py, qz_py = hxrd.Ang2Q.area(
         theta, chi, phi, twotheta; deg=true,
     )
@@ -249,15 +263,6 @@ end
     image_py = np.random.rand(nch1, nch2).astype(np.float64)
     frame_jl = pyconvert(Matrix, image_py)  # (nch1, nch2)
 
-    geom = QST.Geometry(;
-        sample_axes, detector_axes, image_axes,
-        beam_direction, sample_normal, sample_faceup,
-        pixel_size=(pixel_size, pixel_size),
-        center=(nch1 ÷ 2, nch2 ÷ 2),
-        shape=(nch1, nch2),
-        distance=sdd, wavelength=wl,
-    )
-
     # Cross-check the geometry kernel alone: per-pixel q must agree pointwise.
     q_jl = QST.pixel_q_array(geom, (theta, chi, phi), (twotheta,))
     qx_jl = @view q_jl[1, :, :]
@@ -269,7 +274,7 @@ end
     # test: the Julia matvecs use FMA (via StaticArrays) while xrayutilities
     # does plain scalar sums, producing sub-ULP differences in the per-pixel
     # q values. The vast majority of bins are unaffected, but the
-    # `< xmin` / `> xmax` boundary check in fuzzygridder2d will reject a
+    # `< xmin` / `> xmax` boundary check in fuzzygridder! will reject a
     # pixel on one side and accept it on the other. Instead, feed the gridder
     # the SAME (Python-derived) q-array on both sides to isolate it from the
     # geometry layer.
@@ -284,12 +289,12 @@ end
     ref = pyconvert(Matrix{Float64}, gridder.data)
 
     image = Matrix{Float64}(undef, nx, ny)
-    norm  = Matrix{Float64}(undef, nx, ny)
     points = Matrix{Float64}(undef, 2, length(frame_jl))
     points[1, :] .= vec(qx_arr)
     points[2, :] .= vec(qz_arr)
-    QST.fuzzygridder2d!(image, norm, points, frame_jl,
-                        xmin, xmax, ymin, ymax)
+    ws = QST.GridderWorkspace((nx, ny))
+    QST.fuzzygridder!(image, ws, points, frame_jl,
+                      ((xmin, xmax), (ymin, ymax)))
     @test size(image) == (nx, ny)
     @test image ≈ ref rtol=1e-10 atol=1e-12
 
@@ -312,4 +317,312 @@ end
                      projection=(:qy, :qz))
     @test size(parent(got_yz)) == (nx, ny)
     @test name.(dims(got_yz)) == (:qy, :qz)
+end
+
+# The geometry and the 3D gridder are each checked against xrayutilities
+# elsewhere, so this covers only what `rsm` adds on top of them: the frame
+# loop, per-frame angles, and accumulating into one volume normalized once.
+@testset "rsm" begin
+    nch1, nch2 = 32, 40
+    nframes = 5
+    nx, ny, nz = 24, 26, 28
+
+    _, geom = hxrd_geometry(; nch1, nch2)
+
+    # A rocking scan: theta steps per frame, the rest of the chain is fixed.
+    thetas = range(16.0, 18.0; length=nframes)
+    chi, phi, twotheta = 0.05, -0.10, 35.5
+    sample_angles = [(t, chi, phi) for t in thetas]
+    frames = rand(nch1, nch2, nframes)
+
+    # Reference: every frame's q-vectors concatenated into one point set and
+    # gridded in a single call — which is what the streaming frame loop must
+    # reproduce.
+    points = reduce(hcat, (reshape(QST.pixel_q_array(geom, a, (twotheta,)), 3, :)
+                           for a in sample_angles))
+    bounds = ntuple(6) do k
+        row = @view points[cld(k, 2), :]
+        isodd(k) ? minimum(row) : maximum(row)
+    end
+    ref = Array{Float64, 3}(undef, nx, ny, nz)
+    ref_ws = QST.GridderWorkspace((nx, ny, nz))
+    QST.fuzzygridder!(ref, ref_ws, points, vec(frames),
+                      ((bounds[1], bounds[2]), (bounds[3], bounds[4]),
+                       (bounds[5], bounds[6])))
+
+    got = QST.rsm(frames, geom; sample_angles, detector_angles=(twotheta,),
+                  gridder_size=(nx, ny, nz), output=:volume)
+    @test size(parent(got)) == (nx, ny, nz)
+    @test name.(dims(got)) == (:qx, :qy, :qz)
+    @test parent(got) ≈ ref rtol=1e-14
+    @test any(!iszero, got)
+
+    # A bare Real stands in for a single-axis chain.
+    @test parent(QST.rsm(frames, geom; sample_angles, detector_angles=twotheta,
+                         gridder_size=(nx, ny, nz), output=:volume)) == parent(got)
+
+    # Explicit bounds skip the scan pass; a reused workspace must not drift.
+    ws = QST.RSMWorkspace(geom, (nx, ny, nz); output=:volume)
+    out = QST.allocate_output(geom, (nx, ny, nz); output=:volume)
+    for _ in 1:2
+        QST.rsm!(out, frames, geom; sample_angles, detector_angles=(twotheta,),
+                 bounds, workspace=ws)
+        @test out ≈ ref rtol=1e-14
+    end
+
+    # The same workspace type serves RSS at D = 2.
+    ws2 = QST.RSMWorkspace(geom, (nx, ny))
+    img = QST.allocate_output(geom, (nx, ny))
+    QST.rss!(img, view(frames, :, :, 1), geom; sample_angles=sample_angles[1],
+             detector_angles=(twotheta,), workspace=ws2)
+    @test any(!iszero, img)
+end
+
+# `output=:projections` is the default and never builds the volume, so what it
+# adds over the volume path is the per-grid row selection and the guard on the
+# collapsed component. The reference grids the same points over the two rows
+# directly, dropping guarded-out points by NaN-ing their intensity.
+@testset "rsm projections" begin
+    nch1, nch2, nframes = 32, 40, 5
+    grid = (24, 26, 28)
+    _, geom = hxrd_geometry(; nch1, nch2)
+
+    twotheta = 35.5
+    sample_angles = [(t, 0.05, -0.10) for t in range(16.0, 18.0; length=nframes)]
+    detector_angles = (twotheta,)
+    frames = rand(nch1, nch2, nframes)
+
+    points = reduce(hcat, (reshape(QST.pixel_q_array(geom, a, detector_angles), 3, :)
+                           for a in sample_angles))
+    full = ntuple(6) do k
+        row = @view points[cld(k, 2), :]
+        isodd(k) ? minimum(row) : maximum(row)
+    end
+    # Tight enough that the collapsed component rejects points: unguarded, each
+    # projection would keep pixels the volume drops.
+    tight = ntuple(6) do k
+        lo, hi = full[2cld(k, 2) - 1], full[2cld(k, 2)]
+        isodd(k) ? lo + 0.3 * (hi - lo) : hi - 0.3 * (hi - lo)
+    end
+
+    # `a`, `b` are the q-components this projection grids and `g` the third one
+    # it collapses — the components are 1, 2, 3, so the missing one is
+    # `6 - a - b`. `bounds` is flat, two slots per component, so component `c`
+    # spans `bounds[2c - 1]` (min) to `bounds[2c]` (max).
+    function reference((a, b), bounds)
+        g = 6 - a - b
+        data = [(bounds[2g - 1] <= points[g, p] <= bounds[2g]) ? vec(frames)[p] : NaN
+                for p in axes(points, 2)]
+        img = Matrix{Float64}(undef, grid[a], grid[b])
+        ws = QST.GridderWorkspace(size(img))
+        QST.fuzzygridder!(img, ws, points[[a, b], :], data,
+                          ((bounds[2a - 1], bounds[2a]), (bounds[2b - 1], bounds[2b])))
+        return img
+    end
+
+    for bounds in (nothing, tight)
+        got = QST.rsm(frames, geom; sample_angles, detector_angles, gridder_size=grid,
+                      bounds)
+        @test got isa QST.QProjections
+        for (i, pair) in enumerate(QST._PROJECTION_PAIRS)
+            g = QST._output_grids(got)[i]
+            @test name.(dims(g)) == map(c -> (:qx, :qy, :qz)[c], pair)
+            @test parent(g) ≈ reference(pair, something(bounds, full)) rtol=1e-14
+        end
+    end
+
+    # Projections and volume are gridded on the same axes.
+    vol = QST.rsm(frames, geom; sample_angles, detector_angles, gridder_size=grid,
+                  output=:volume)
+    got = QST.rsm(frames, geom; sample_angles, detector_angles, gridder_size=grid)
+    @test dims(got.qxqz) == (dims(vol, :qx), dims(vol, :qz))
+
+    # In-place into caller-owned projections, with a reused workspace.
+    ws = QST.RSMWorkspace(geom, grid)
+    out = QST.allocate_output(geom, grid)
+    @test out isa QST.QProjections
+    for _ in 1:2
+        QST.rsm!(out, frames, geom; sample_angles, detector_angles, workspace=ws)
+        @test out ≈ got
+    end
+
+    # The projections share their axes pairwise, so inconsistent sizes describe
+    # no grid.
+    bad = QST.QProjections(zeros(grid[1], grid[2]), zeros(grid[1], grid[3]),
+                           zeros(grid[2], grid[3] + 1))
+    @test_throws ArgumentError QST.rsm!(bad, frames, geom; sample_angles, detector_angles)
+    @test_throws ArgumentError QST.rsm(frames, geom; sample_angles, detector_angles,
+                                       output=:slices)
+end
+
+# `rsm!` is a bounds scan followed by the streaming interface, so what the
+# accumulator has to show is that driving it by hand reproduces the batch call
+# exactly — and that summing it leaves it accumulating.
+@testset "RSMAccumulator" begin
+    nch1, nch2, nframes = 32, 40, 5
+    grid = (24, 26, 28)
+    _, geom = hxrd_geometry(; nch1, nch2)
+
+    detector_angles = (35.5,)
+    sample_angles = [(t, 0.05, -0.10) for t in range(16.0, 18.0; length=nframes)]
+    frames = rand(nch1, nch2, nframes)
+
+    # The scan reads no frame data, so it can fix the grid before any image is
+    # loaded.
+    bounds = QST.q_bounds(geom; sample_angles, detector_angles)
+
+    for output in (:projections, :volume)
+        ref = QST.rsm(frames, geom; sample_angles, detector_angles,
+                      gridder_size=grid, output, bounds)
+
+        acc = QST.RSMAccumulator(geom; bounds, gridder_size=grid, output)
+        for i in 1:nframes
+            push!(acc, view(frames, :, :, i); sample_angles=sample_angles[i],
+                  detector_angles)
+        end
+        @test sum(acc) == ref
+
+        # Summing is non-destructive: repeatable, and frames may still follow.
+        @test sum(acc) == ref
+        push!(acc, view(frames, :, :, 1); sample_angles=sample_angles[1],
+              detector_angles)
+        @test sum(acc) != ref
+
+        empty!(acc)
+        append!(acc, frames; sample_angles, detector_angles)
+        @test sum(acc) == ref
+    end
+end
+
+# The regular-grid constructor delegates to the positions one, so the
+# xrayutilities comparison above already covers it. What's left is the 3D
+# `data_shape`: the same positions declared as a module stack must reproduce
+# the flat result exactly, lined up by the column order of `positions`.
+@testset "multi-module data_shape" begin
+    nch1, nch2, nmod, nframes = 32, 40, 5, 4
+    grid = (16, 18, 20)
+
+    common = (; sample_axes=("y-", "x+", "z+"), detector_axes=("y-",),
+                image_axes=("y-", "z-"), beam_direction=(1.0, 0.0, 0.0),
+                sample_normal=(0.0, 0.0, 1.0), sample_faceup="z+",
+                pixel_size=(0.2, 0.2), center=(nch1 ÷ 2, nch2 ÷ 2),
+                distance=500.0, wavelength=QST.energy2wavelength(8000.0))
+
+    # Any (3, npix) array is valid here; a real detector's own directions keep
+    # the gridded output physically sensible.
+    positions = QST.Geometry(; shape=(nch1, nch2), common...).directions
+    flat = QST.Geometry(positions, (nch1, nch2); common...)
+    split = QST.Geometry(positions, (nch1, nch2 ÷ nmod, nmod); common...)
+
+    @test QST.npixels(split) == nch1 * nch2
+    @test QST.data_shape(split) == (nch1, nch2 ÷ nmod, nmod)
+
+    sample_angles = [(t, 0.05, -0.10) for t in range(16.0, 18.0; length=nframes)]
+    detector_angles = (35.5,)
+    frames = rand(nch1, nch2, nframes)
+    split_frames = reshape(frames, nch1, nch2 ÷ nmod, nmod, nframes)
+
+    @test reshape(QST.pixel_q_array(split, sample_angles[1], detector_angles), 3, nch1, nch2) ==
+          QST.pixel_q_array(flat, sample_angles[1], detector_angles)
+
+    @test QST.rsm(split_frames, split; sample_angles, detector_angles, gridder_size=grid) ==
+          QST.rsm(frames, flat; sample_angles, detector_angles, gridder_size=grid)
+
+    @test QST.rss(view(split_frames, :, :, :, 1), split;
+                  sample_angles=sample_angles[1], detector_angles) ==
+          QST.rss(view(frames, :, :, 1), flat;
+                  sample_angles=sample_angles[1], detector_angles)
+
+    @test_throws ArgumentError QST.rsm(rand(nch1, nch2 + 1, nframes), flat;
+                                       sample_angles, detector_angles)
+    @test_throws DimensionMismatch QST.Geometry(positions, (nch1, nch2 + 1); common...)
+end
+
+@testset "fuzzygridder! matches xu.FuzzyGridder3D" begin
+    # Python grids (nx, ny, nz) row-major; Julia grids (nz, ny, nx)
+    # column-major, so both languages iterate the same fast axis. Julia
+    # bounds/points are therefore in (z, y, x) order throughout, and numpy
+    # results are converted through `.T` so the layouts line up. Three
+    # distinct extents keep an axis mix-up from passing unnoticed.
+    nx, ny, nz = 13, 11, 9
+    xrange = (-1.0, 1.0)
+    yrange = (0.0, 5.0)
+    zrange = (-3.0, -1.0)
+    bounds = (zrange, yrange, xrange)
+
+    # Sample each axis a little wider than its grid range so out-of-bounds
+    # points (which both implementations must drop) occur naturally.
+    npts = 4000
+    pad(lo, hi) = (lo - 0.15 * (hi - lo), hi + 0.15 * (hi - lo))
+    coords = reduce(vcat, map(bounds) do (lo, hi)
+        pyconvert(Matrix{Float64}, np.random.uniform(pad(lo, hi)..., (1, npts)))
+    end)
+    values = pyconvert(Vector{Float64}, np.random.rand(npts))
+
+    # Points sitting exactly on the grid limits: the `<= min` / `>= max` bin
+    # clamps in both kernels are only exercised here.
+    corners = [zrange[1] zrange[2] zrange[1] zrange[2] zrange[1]
+               yrange[1] yrange[2] yrange[2] yrange[1] yrange[2]
+               xrange[1] xrange[2] xrange[1] xrange[2] sum(xrange)/2]
+    coords = hcat(coords, corners)
+    values = vcat(values, fill(0.75, size(corners, 2)))
+
+    # NaN intensities are dropped by both sides.
+    values[3:97:end] .= NaN
+
+    zs, ys, xs = coords[1, :], coords[2, :], coords[3, :]
+
+    # Run xrayutilities on the same coordinates. `data` is the normalized
+    # volume, `_gnorm` the raw denominator — the Julia `norm` buffer is
+    # likewise left un-normalized.
+    xs_py, ys_py, zs_py = np.asarray(xs), np.asarray(ys), np.asarray(zs)
+    values_py = np.asarray(values)
+
+    function reference(width)
+        g = xu.FuzzyGridder3D(nx, ny, nz)
+        g.dataRange(xrange..., yrange..., zrange..., true)
+        if isnothing(width)
+            g(xs_py, ys_py, zs_py, values_py)
+        else
+            g(xs_py, ys_py, zs_py, values_py; width=pylist(width))
+        end
+        return (pyconvert(Array{Float64, 3}, g.data.T),
+                pyconvert(Array{Float64, 3}, g._gnorm.T))
+    end
+
+    dz = QST._bin_delta(zrange..., nz)
+    dy = QST._bin_delta(yrange..., ny)
+    dx = QST._bin_delta(xrange..., nx)
+
+    @testset "widths=$label" for (label, widths, py_width) in (
+        ("default", nothing, nothing),
+        # Equal widths on every axis, spanning several bins so the multi-bin
+        # Cartesian path and the partial end-bin overlaps are hit hard.
+        ("scalar", (0.35, 0.35, 0.35), [0.35, 0.35, 0.35]),
+        # Per-axis widths, each a different multiple of its own bin spacing.
+        # `py_width` is in (x, y, z) order to match xrayutilities' signature.
+        ("per-axis", (4.4 * dz, 2.7 * dy, 1.2 * dx), [1.2 * dx, 2.7 * dy, 4.4 * dz]),
+    )
+        ref_image, ref_norm = reference(py_width)
+
+        image = Array{Float64, 3}(undef, nz, ny, nx)
+        ws = QST.GridderWorkspace((nz, ny, nx))
+        QST.fuzzygridder!(image, ws, coords, values, bounds; widths)
+        norm = ws.norm
+        @test size(image) == (nz, ny, nx)
+        @test any(>(0), norm)
+        @test norm ≈ ref_norm rtol=1e-12 atol=1e-14
+        @test image ≈ ref_image rtol=1e-12 atol=1e-14
+
+        # Disjoint slabs of the last dimension covering 1:nx must reassemble
+        # into exactly the full-volume result.
+        slabbed = Array{Float64, 3}(undef, nz, ny, nx)
+        slab_ws = QST.GridderWorkspace((nz, ny, nx))
+        for slab in (1:2, 3:3, 4:nx)
+            QST.fuzzygridder!(slabbed, slab_ws, coords, values, bounds;
+                              widths, last_range=slab)
+        end
+        @test slabbed == image
+        @test slab_ws.norm == norm
+    end
 end
